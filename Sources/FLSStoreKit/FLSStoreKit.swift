@@ -18,6 +18,8 @@ public struct FLSOfferConfiguration: Sendable, Equatable {
         case standard
         case introductory
         case promotional(FLSPromotionalOfferSignature)
+        /// 后端使用 JWS 签名的促销优惠，签名内容由后端生成。
+        case promotionalJWS(offerID: String, compactJWS: String)
         case offerCode(referenceName: String)
         case winBack
     }
@@ -93,6 +95,10 @@ public enum FLSStoreKitError: Error, LocalizedError, Sendable, Equatable {
     case productNotFound(String)
     case unverifiedTransaction(String)
     case unsupportedOffer(String)
+    case invalidPurchaseRequest(String)
+    case purchaseInProgress
+    case staleTransaction(UInt64)
+    case transactionNotFound(UInt64)
     case missingScene
     case failed(String)
 
@@ -101,6 +107,10 @@ public enum FLSStoreKitError: Error, LocalizedError, Sendable, Equatable {
         case .productNotFound(let id): "Product \(id) was not found."
         case .unverifiedTransaction(let message): "The transaction could not be verified: \(message)"
         case .unsupportedOffer(let message): message
+        case .invalidPurchaseRequest(let message): message
+        case .purchaseInProgress: "Another purchase is already in progress."
+        case .staleTransaction(let id): "Transaction \(id) has expired or been revoked."
+        case .transactionNotFound(let id): "Verified unfinished transaction \(id) was not found."
         case .missingScene: "A window scene is required to manage subscriptions."
         case .failed(let message): message
         }
@@ -129,164 +139,6 @@ public final class FLSProductStore: ObservableObject {
             lastError = .failed(error.localizedDescription)
         }
         return products
-    }
-}
-
-@MainActor
-/// StoreKit 2 购买、交易监听和权益刷新管理器。
-public final class FLSStoreKitManager: ObservableObject {
-    @Published public private(set) var products: [Product] = []
-    @Published public private(set) var entitledProductIDs: Set<String> = []
-    @Published public private(set) var subscriptionStatuses: [String: FLSSubscriptionStatus] = [:]
-    @Published public private(set) var isLoading = false
-    @Published public private(set) var lastError: FLSStoreKitError?
-
-    private var updatesTask: Task<Void, Never>?
-    private var productIDs: [String] = []
-    public let productStore: FLSProductStore
-
-    /// 创建管理器并开始监听 StoreKit 交易更新。
-    public init(productStore: FLSProductStore? = nil) {
-        self.productStore = productStore ?? FLSProductStore()
-        updatesTask = Task { [weak self] in await self?.observeTransactions() }
-    }
-
-    deinit { updatesTask?.cancel() }
-
-    /// 配置商品 ID，完成商品查询并刷新当前权益。
-    public func configure(productIDs: [String]) async {
-        self.productIDs = productIDs
-        products = await productStore.load(productIDs: productIDs)
-        await refreshEntitlements()
-    }
-
-    /// 根据商品 ID 读取已经查询到的商品。
-    public func product(id: String) -> Product? { products.first { $0.id == id } }
-
-    /// 查询自动续订订阅是否满足 Introductory Offer 条件。
-    ///
-    /// 是否符合资格由 StoreKit 根据当前 Apple ID 的历史权益判断，业务层不应自行缓存结论。
-    public func isEligibleForIntroOffer(productID: String) async -> Bool {
-        guard let product = product(id: productID), let subscription = product.subscription else { return false }
-        return await subscription.isEligibleForIntroOffer
-    }
-
-    /// 发起一次商品购买；优惠签名必须由宿主 App 或后端提供。
-    public func purchase(productID: String, offer: FLSOfferConfiguration = .standard) async throws -> FLSPurchaseResult {
-        guard let product = product(id: productID) else { throw FLSStoreKitError.productNotFound(productID) }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            var options = Set<Product.PurchaseOption>()
-            switch offer.kind {
-            case .standard, .introductory:
-                break
-            case .promotional(let signature):
-                options.insert(.promotionalOffer(offerID: signature.offerID, keyID: signature.keyID, nonce: signature.nonce, signature: signature.signature, timestamp: signature.timestamp))
-            case .offerCode(let referenceName):
-                throw FLSStoreKitError.unsupportedOffer("Offer code \(referenceName) must be redeemed through FLSOfferCodeView.")
-            case .winBack:
-                throw FLSStoreKitError.unsupportedOffer("Win-back offers require an App Store configuration supported by the current OS version.")
-            }
-            return try await purchase(product: product, options: options)
-        } catch let error as FLSStoreKitError {
-            lastError = error
-            throw error
-        } catch {
-            let mapped = FLSStoreKitError.failed(error.localizedDescription)
-            lastError = mapped
-            throw mapped
-        }
-    }
-
-    /// 请求 App Store 同步当前 Apple ID 的历史购买记录。
-    public func restorePurchases() async throws {
-        try await AppStore.sync()
-        await refreshEntitlements()
-    }
-
-    /// 读取当前有效权益，并刷新自动续订订阅状态。
-    public func refreshEntitlements() async {
-        var entitled: Set<String> = []
-        for await result in Transaction.currentEntitlements {
-            if let transaction = try? verifiedTransaction(result) {
-                entitled.insert(transaction.productID)
-                await transaction.finish()
-            }
-        }
-        entitledProductIDs = entitled
-        await refreshSubscriptionStatuses()
-    }
-
-    /// 刷新每个自动续订订阅的续订、过期和宽限期状态。
-    public func refreshSubscriptionStatuses() async {
-        var statuses: [String: FLSSubscriptionStatus] = [:]
-        for product in products {
-            guard let subscription = product.subscription else { continue }
-            guard let statusResults = try? await subscription.status else { continue }
-            for statusResult in statusResults {
-                guard let status = try? verifiedSubscriptionStatus(statusResult) else { continue }
-                let expiration = status.transaction.productID == product.id ? status.transaction.expirationDate : nil
-                let isEntitled = status.state == Product.SubscriptionInfo.RenewalState.subscribed || status.state == Product.SubscriptionInfo.RenewalState.inGracePeriod
-                let isInGracePeriod = status.state == Product.SubscriptionInfo.RenewalState.inGracePeriod
-                statuses[product.id] = FLSSubscriptionStatus(productID: product.id, isEntitled: isEntitled, expirationDate: expiration, willAutoRenew: status.renewalInfo.willAutoRenew, isInGracePeriod: isInGracePeriod)
-            }
-        }
-        subscriptionStatuses = statuses
-    }
-
-    /// 打开系统订阅管理页面。
-    public func manageSubscriptions() async throws {
-#if canImport(UIKit)
-        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { throw FLSStoreKitError.missingScene }
-        try await AppStore.showManageSubscriptions(in: scene)
-#else
-        throw FLSStoreKitError.missingScene
-#endif
-    }
-
-    private func purchase(product: Product, options: Set<Product.PurchaseOption>) async throws -> FLSPurchaseResult {
-        switch try await product.purchase(options: options) {
-        case .success(let verification):
-            let transaction = try verifiedTransaction(verification)
-            await transaction.finish()
-            await refreshEntitlements()
-            return .purchased(productID: transaction.productID, transactionID: transaction.id)
-        case .userCancelled:
-            return .cancelled(productID: product.id)
-        case .pending:
-            return .pending(productID: product.id)
-        @unknown default:
-            throw FLSStoreKitError.failed("StoreKit returned an unknown purchase result.")
-        }
-    }
-
-    private func observeTransactions() async {
-        for await result in Transaction.updates {
-            guard let transaction = try? verifiedTransaction(result) else { continue }
-            await transaction.finish()
-            await refreshEntitlements()
-        }
-    }
-
-    private func verifiedTransaction(_ result: VerificationResult<StoreKit.Transaction>) throws -> StoreKit.Transaction {
-        switch result {
-        case .verified(let transaction): return transaction
-        case .unverified(_, let error): throw FLSStoreKitError.unverifiedTransaction(error.localizedDescription)
-        }
-    }
-
-    private func verifiedSubscriptionStatus(_ result: Product.SubscriptionInfo.Status) throws -> (state: Product.SubscriptionInfo.RenewalState, renewalInfo: Product.SubscriptionInfo.RenewalInfo, transaction: StoreKit.Transaction) {
-        let renewalInfo = try verified(result.renewalInfo)
-        let transaction = try verified(result.transaction)
-        return (result.state, renewalInfo, transaction)
-    }
-
-    private func verified<T>(_ result: VerificationResult<T>) throws -> T {
-        switch result {
-        case .verified(let value): return value
-        case .unverified(_, let error): throw FLSStoreKitError.unverifiedTransaction(error.localizedDescription)
-        }
     }
 }
 
@@ -321,10 +173,17 @@ public struct FLSProductCard: View {
 public struct FLSProductPurchaseView: View {
     @ObservedObject private var manager: FLSStoreKitManager
     private let productIDs: [String]
+    private let purchaseRequest: (Product) -> FLSPurchaseRequest
+    private let onPurchaseResult: ((Result<FLSPurchaseOutcome, Error>) -> Void)?
 
-    public init(manager: FLSStoreKitManager, productIDs: [String]) {
+    /// 宿主可按商品注入账户与优惠参数；结果回调不等于服务器已发放权益。
+    public init(manager: FLSStoreKitManager, productIDs: [String],
+                purchaseRequest: @escaping (Product) -> FLSPurchaseRequest = { .init(productID: $0.id) },
+                onPurchaseResult: ((Result<FLSPurchaseOutcome, Error>) -> Void)? = nil) {
         self.manager = manager
         self.productIDs = productIDs
+        self.purchaseRequest = purchaseRequest
+        self.onPurchaseResult = onPurchaseResult
     }
 
     public var body: some View {
@@ -339,7 +198,13 @@ public struct FLSProductPurchaseView: View {
                     VStack(spacing: 12) {
                         ForEach(manager.products, id: \.id) { product in
                             FLSProductCard(product: product, isPurchasing: manager.isLoading) {
-                                Task { try? await manager.purchase(productID: product.id) }
+                                Task {
+                                    do {
+                                        let result = try await manager.purchase(purchaseRequest(product))
+                                        onPurchaseResult?(.success(result))
+                                    }
+                                    catch { onPurchaseResult?(.failure(error)) }
+                                }
                             }
                         }
                     }
@@ -355,15 +220,23 @@ public struct FLSProductPurchaseView: View {
 public struct FLSSubscriptionView: View {
     @ObservedObject private var manager: FLSStoreKitManager
     private let productIDs: [String]
+    private let purchaseRequest: (Product) -> FLSPurchaseRequest
+    private let onPurchaseResult: ((Result<FLSPurchaseOutcome, Error>) -> Void)?
 
-    public init(manager: FLSStoreKitManager, productIDs: [String]) {
+    /// 宿主可按商品注入账户与优惠参数；结果回调不等于服务器已发放权益。
+    public init(manager: FLSStoreKitManager, productIDs: [String],
+                purchaseRequest: @escaping (Product) -> FLSPurchaseRequest = { .init(productID: $0.id) },
+                onPurchaseResult: ((Result<FLSPurchaseOutcome, Error>) -> Void)? = nil) {
         self.manager = manager
         self.productIDs = productIDs
+        self.purchaseRequest = purchaseRequest
+        self.onPurchaseResult = onPurchaseResult
     }
 
     public var body: some View {
         VStack(spacing: 16) {
-            FLSProductPurchaseView(manager: manager, productIDs: productIDs)
+            FLSProductPurchaseView(manager: manager, productIDs: productIDs,
+                                   purchaseRequest: purchaseRequest, onPurchaseResult: onPurchaseResult)
             Button("恢复购买") { Task { try? await manager.restorePurchases() } }
             Button("管理订阅") { Task { try? await manager.manageSubscriptions() } }
         }
