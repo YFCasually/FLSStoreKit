@@ -1,0 +1,32 @@
+{
+  "identifier": "FLSLocalDemo",
+  "nonRenewingSubscriptions": [],
+  "products": [
+    {
+      "displayPrice": "0.99",
+      "familyShareable": false,
+      "internalID": "100001",
+      "localizations": [
+        {
+          "description": "本地购买参数测试",
+          "displayName": "示例金币",
+          "locale": "en_US"
+        }
+      ],
+      "productID": "com.fls.demo.coins",
+      "referenceName": "Demo Coins",
+      "type": "Consumable"
+    }
+  ],
+  "settings": {
+    "_failTransactionsEnabled": false,
+    "_locale": "en_US",
+    "_storefront": "USA",
+    "_storeKitErrors": []
+  },
+  "subscriptionGroups": [],
+  "version": {
+    "major": 3,
+    "minor": 0
+  }
+}
